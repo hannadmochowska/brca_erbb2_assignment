@@ -1,0 +1,212 @@
+---
+title: "TCGA BRCA – ERBB2 (HER2) Differential Expression"
+author: "Hanna Dmochowska"
+output: html_notebook
+---
+
+## Setup
+```{r}
+# load libraries
+library(DESeq2)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(pheatmap)
+library(survival)
+library(glmnet)
+```
+
+# Locate and load TCGA files
+```{r}
+options(stringsAsFactors = FALSE)
+
+# Path to the downloaded .tar file
+tarfile <- "data/brca_tcga_pan_can_atlas_2018.tar"
+
+# Untar into "data" folder
+untar(tarfile, exdir = "data")
+
+# Path to the extracted BRCA folder
+brca_dir <- "data/brca_tcga_pan_can_atlas_2018"
+
+# File paths
+rna_file     <- file.path(brca_dir, "data_mrna_seq_v2_rsem.txt")
+patient_file <- file.path(brca_dir, "data_clinical_patient.txt")
+cna_file     <- file.path(brca_dir, "data_cna.txt")
+
+# Read the three datasets
+rna      <- read.delim(rna_file,     check.names = FALSE)
+patients <- read.delim(patient_file, check.names = FALSE)
+cna      <- read.delim(cna_file,     check.names = FALSE)
+```
+
+# Clean clinical data
+```{r}
+header_row <- which(patients[, 1] == "PATIENT_ID")[1] # find the row where the first column equals "PATIENT_ID"
+
+clin <- patients[(header_row + 1):nrow(patients), ]
+colnames(clin) <- patients[header_row, ]
+```
+
+# RNA expression matrix
+```{r}
+expr_mat <- as.matrix(rna[, -c(1, 2)])   # drop Hugo_Symbol and Entrez_Gene_Id
+rownames(expr_mat) <- rna$Hugo_Symbol    # gene symbols as row names
+
+# check
+expr_mat[1:5, 1:5]
+```
+
+# Extract ERBB2 copy-number and define HER2 status
+```{r}
+# ERBB2 CNA values
+erbb2_vals <- setNames(
+  as.numeric(cna[cna$Hugo_Symbol == "ERBB2", -c(1, 2)]),
+  colnames(cna)[-c(1, 2)]
+)
+
+# helper to standardise TCGA IDs
+id <- function(x) substr(gsub("\\.", "-", x), 1, 12)
+
+pat_rna <- id(colnames(expr_mat))
+pat_cna <- id(names(erbb2_vals))
+
+# match ERBB2 CNA to RNA samples
+her2_cna <- erbb2_vals[match(pat_rna, pat_cna)]
+
+# keep only samples with known HER2
+keep      <- !is.na(her2_cna)
+expr_mat  <- expr_mat[, keep, drop = FALSE]
+
+coldata <- data.frame(
+  patient_id = pat_rna[keep],
+  HER2       = factor(ifelse(her2_cna[keep] > 0, "Amp", "NotAmp"),
+                      levels = c("NotAmp", "Amp")),
+  row.names  = colnames(expr_mat)
+)
+
+# check
+head(coldata)
+```
+
+# Normalise data
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = round(expr_mat),
+  colData   = coldata,
+  design    = ~ HER2
+)
+
+dds <- dds[rowSums(counts(dds)) > 10, ]
+dds <- DESeq(dds)
+```
+
+# Differentially Expressed Genes
+```{r}
+# DESeq2 results: Amp vs NotAmp (Amp - NotAmp)
+res <- results(dds, contrast = c("HER2", "Amp", "NotAmp"))
+
+res_df <- as.data.frame(res)
+res_df$gene <- rownames(res_df)
+
+# drop NA padj and sort by FDR
+res_df <- res_df[!is.na(res_df$padj), ]
+res_df <- res_df[order(res_df$padj), ]
+
+# check
+head(res_df)
+```
+
+# Pathway Enrichment Analysis
+```{r}
+# significant DE genes
+sig <- subset(res_df, padj < 0.05 & !is.na(padj))
+
+# helper: SYMBOL to ENTREZ
+to_entrez <- function(g)
+  suppressWarnings(
+    suppressMessages(
+      bitr(g, fromType = "SYMBOL", toType = "ENTREZID",
+           OrgDb = org.Hs.eg.db)
+    )
+  )$ENTREZID
+
+# enrich up/down
+react_up   <- enrichPathway(to_entrez(sig$gene[sig$log2FoldChange > 0]),
+                            organism = "human")
+
+react_down <- enrichPathway(to_entrez(sig$gene[sig$log2FoldChange < 0]),
+                            organism = "human")
+
+# plots
+dotplot(react_up, showCategory = 10, font.size = 7, label_format = 30) +
+  ggtitle("Reactome: Upregulated in HER2+ tumours") +
+  theme(axis.text.y = element_text(size = 6))
+
+dotplot(react_down, showCategory = 10, font.size = 7, label_format = 30) +
+  ggtitle("Reactome: Downregulated in HER2+ tumours") +
+  theme(axis.text.y = element_text(size = 6))
+
+```
+
+# Variance stabilised transformed expression values
+```{r}
+vsd     <- vst(dds, blind = TRUE)
+vst_mat <- assay(vsd)
+```
+
+# PCA plot and a heatmap
+```{r}
+## PCA plot (DESeq2 convenience function)
+plotPCA(vsd, intgroup = "HER2")
+
+## Heatmap of top 500 most variable genes
+vst_var <- apply(vst_mat, 1, var)
+top_genes <- names(sort(vst_var, decreasing = TRUE))[1:500]
+
+ann <- data.frame(HER2 = coldata$HER2)
+rownames(ann) <- rownames(coldata)
+
+pheatmap(
+  vst_mat[top_genes, ],
+  annotation_col = ann,
+  show_rownames  = FALSE,
+  scale          = "row"
+)
+```
+
+# Overall survival model
+```{r}
+
+# DE genes (top 100 by FDR)
+sig       <- subset(res_df, padj < 0.05 & !is.na(padj))
+top_genes <- head(sig$gene[order(sig$padj)], 100)
+vst_de    <- vst_mat[intersect(top_genes, rownames(vst_mat)), , drop = FALSE]
+
+# survival data
+time_col   <- grep("Overall.Survival..Months|OS_MONTH",   colnames(clin), value = TRUE)[1]
+status_col <- grep("Overall.Survival.Status|OS_STATUS",   colnames(clin), value = TRUE)[1]
+clin_expr  <- clin[match(coldata$patient_id, clin$PATIENT_ID), ]
+
+time_raw   <- as.numeric(clin_expr[[time_col]])
+status_num <- ifelse(grepl("^1", clin_expr[[status_col]]), 1, 0)
+
+keep <- !is.na(time_raw) & time_raw > 0 & !is.na(status_num)
+
+x <- t(vst_de[, keep, drop = FALSE])
+y <- Surv(time_raw[keep], status_num[keep])
+
+# LASSO Cox
+set.seed(123)
+cvfit <- cv.glmnet(x, y, family = "cox", alpha = 1)
+
+coef_lasso <- coef(cvfit, s = "lambda.min")
+nz         <- which(coef_lasso != 0)
+
+data.frame(
+  gene = rownames(coef_lasso)[nz],
+  coef = round(as.numeric(coef_lasso[nz]), 3)
+)
+
+```
