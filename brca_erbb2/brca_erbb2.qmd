@@ -86,10 +86,28 @@ coldata <- data.frame(
   row.names  = colnames(expr_mat)
 )
 
-# check
-head(coldata)
-```
+n_samples <- ncol(dds) # total number of tumour samples used in DESeq2
+table(coldata$HER2) # number in each group
 
+# Number of significant DE genes, up and down
+res_df <- as.data.frame(res)
+res_df <- res_df[!is.na(res_df$padj), ]
+
+sig <- subset(res_df, padj < 0.05) # all significant genes
+
+N  <- nrow(sig)                            # total significant
+X  <- sum(sig$log2FoldChange > 0)          # up in HER2+
+Y  <- sum(sig$log2FoldChange < 0)          # down in HER2+
+c(N = N, up = X, down = Y)
+
+# top genes by adjusted p-value
+head(sig[order(sig$padj), c("log2FoldChange","padj")])
+
+# top by absolute fold change
+head(sig[order(abs(sig$log2FoldChange), decreasing = TRUE),
+         c("log2FoldChange","padj")])
+
+```
 # Normalise data
 ```{r}
 dds <- DESeqDataSetFromMatrix(
@@ -100,6 +118,24 @@ dds <- DESeqDataSetFromMatrix(
 
 dds <- dds[rowSums(counts(dds)) > 10, ]
 dds <- DESeq(dds)
+```
+# Top 10 differentially expressed genes
+```{r}
+# Extract full DE results
+res_df <- as.data.frame(res)
+
+# Add gene names as a column
+res_df$gene <- rownames(res_df)
+
+# Remove NAs, order by p-value
+res_df <- res_df[!is.na(res_df$padj), ]
+res_df <- res_df[order(res_df$padj), ]
+
+# Top 10 DEGs ranked by absolute log2 fold change
+top10_fc <- res_df[order(abs(res_df$log2FoldChange), decreasing = TRUE), ][1:10, ]
+top10_fc
+knitr::kable(top10_fc, caption = "Top 10 differentially expressed genes ranked by |log2FC|")
+
 ```
 
 # Differentially Expressed Genes
